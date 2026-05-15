@@ -23,6 +23,8 @@ use crate::NvBmc;
 use crate::ProtocolFeatures;
 use crate::Resource;
 use crate::ResourceSchema;
+#[cfg(feature = "task-service")]
+use std::fmt;
 use std::sync::Arc;
 use tagged_types::TaggedType;
 
@@ -42,6 +44,8 @@ use crate::manager::ManagerCollection;
 use crate::oem::hpe::HpeiLoServiceExt;
 #[cfg(feature = "session-service")]
 use crate::session_service::SessionService;
+#[cfg(feature = "task-service")]
+use crate::task::Task;
 #[cfg(feature = "telemetry-service")]
 use crate::telemetry_service::TelemetryService;
 #[cfg(feature = "update-service")]
@@ -286,6 +290,28 @@ impl<B: Bmc> ServiceRoot<B> {
     #[cfg(feature = "managers")]
     pub async fn managers(&self) -> Result<Option<ManagerCollection<B>>, Error<B>> {
         ManagerCollection::new(&self.bmc, self).await
+    }
+
+    /// Get a task by task ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if retrieving task data fails.
+    #[cfg(feature = "task-service")]
+    pub async fn task(&self, task_id: impl fmt::Display) -> Result<Task<B>, Error<B>> {
+        let task_uri = format!("/redfish/v1/TaskService/Tasks/{task_id}");
+
+        self.task_by_uri(task_uri).await
+    }
+
+    /// Get a task by task URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if retrieving task data fails.
+    #[cfg(feature = "task-service")]
+    pub async fn task_by_uri(&self, task_uri: impl AsRef<str>) -> Result<Task<B>, Error<B>> {
+        Task::new(&self.bmc, task_uri.as_ref().to_string().into()).await
     }
 
     /// Get HPE OEM extension in service root

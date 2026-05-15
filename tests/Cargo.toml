@@ -30,7 +30,10 @@ nv-redfish = { workspace = true, features = [
     "oem-supermicro",
     "oem-liteon",
     "power-supplies",
+    "processors",
+    "sensors",
     "session-service",
+    "task-service",
     "update-service",
 ] }
 serde = { workspace = true, features = ["derive"] }

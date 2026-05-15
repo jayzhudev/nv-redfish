@@ -29,7 +29,11 @@ use crate::NvBmc;
 use crate::Resource;
 use crate::ResourceSchema;
 use nv_redfish_core::bmc::Bmc;
+use nv_redfish_core::Action;
+use nv_redfish_core::EntityTypeRef as _;
+use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::NavProperty;
+use serde::Serialize;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -45,6 +49,8 @@ use crate::chassis::Power;
 use crate::chassis::PowerSupply;
 #[cfg(feature = "thermal")]
 use crate::chassis::Thermal;
+#[cfg(feature = "sensors")]
+use crate::environment_metrics::EnvironmentMetrics;
 #[cfg(feature = "log-services")]
 use crate::log_service::LogService;
 #[cfg(all(feature = "oem-liteon", feature = "power-supplies"))]
@@ -76,6 +82,15 @@ pub type PartNumber<T> = HardwareIdPartNumber<T, ChassisTag>;
 
 /// Chassis serial number.
 pub type SerialNumber<T> = HardwareIdSerialNumber<T, ChassisTag>;
+
+#[cfg(feature = "oem-nvidia")]
+const AUX_POWER_RESET_ACTION: &str = "Actions/Oem/NvidiaChassis.AuxPowerReset";
+#[cfg(feature = "oem-nvidia")]
+const AUX_POWER_CYCLE: &str = "AuxPowerCycle";
+const POWERSHELF_FORCE_OFF_ACTION: &str = "Actions/Chassis.ForceOff";
+const POWERSHELF_FORCE_OFF: &str = "ForceOff";
+const POWERSHELF_ON_ACTION: &str = "Actions/Chassis.On";
+const POWERSHELF_ON: &str = "On";
 
 pub struct Config {
     pub read_patch_fn: Option<ReadPatchFn>,
@@ -139,6 +154,68 @@ impl<B: Bmc> Chassis<B> {
     #[must_use]
     pub fn raw(&self) -> Arc<ChassisSchema> {
         self.data.clone()
+    }
+
+    /// Run the NVIDIA auxiliary power reset action for this chassis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BMC rejects the action.
+    #[cfg(feature = "oem-nvidia")]
+    pub async fn aux_power_reset(&self) -> Result<ModificationResponse<()>, Error<B>> {
+        self.run_action(
+            AUX_POWER_RESET_ACTION,
+            &AuxPowerResetRequest {
+                reset_type: AUX_POWER_CYCLE,
+            },
+        )
+        .await
+    }
+
+    /// Run the powershelf force-off action for this chassis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BMC rejects the action.
+    pub async fn powershelf_force_off(&self) -> Result<ModificationResponse<()>, Error<B>> {
+        self.run_action(
+            POWERSHELF_FORCE_OFF_ACTION,
+            &PowershelfForceOffRequest {
+                force_off_type: POWERSHELF_FORCE_OFF,
+            },
+        )
+        .await
+    }
+
+    /// Run the powershelf on action for this chassis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BMC rejects the action.
+    pub async fn powershelf_on(&self) -> Result<ModificationResponse<()>, Error<B>> {
+        self.run_action(
+            POWERSHELF_ON_ACTION,
+            &PowershelfOnRequest {
+                on_type: POWERSHELF_ON,
+            },
+        )
+        .await
+    }
+
+    async fn run_action<T>(
+        &self,
+        action_path: &str,
+        request: &T,
+    ) -> Result<ModificationResponse<()>, Error<B>>
+    where
+        T: Send + Sync + Serialize,
+    {
+        let action = Action::<T, ()>::new(format!("{}/{action_path}", self.data.odata_id()));
+
+        action
+            .run(self.bmc.as_ref(), request)
+            .await
+            .map_err(Error::Bmc)
     }
 
     /// Get hardware identifier of the network adpater.
@@ -329,6 +406,22 @@ impl<B: Bmc> Chassis<B> {
             .collect())
     }
 
+    /// Get environment metrics for this chassis.
+    ///
+    /// Returns `Ok(None)` when the environment metrics link is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching environment metrics data fails.
+    #[cfg(feature = "sensors")]
+    pub async fn environment_metrics(&self) -> Result<Option<EnvironmentMetrics<B>>, Error<B>> {
+        if let Some(env_ref) = &self.data.environment_metrics {
+            EnvironmentMetrics::new(&self.bmc, env_ref).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get the sensors collection for this chassis.
     ///
     /// Returns all available sensors associated with the chassis, and `Ok(None)`
@@ -453,4 +546,23 @@ fn normalize_empty_uuid_field(mut v: JsonValue) -> JsonValue {
         }
     }
     v
+}
+
+#[cfg(feature = "oem-nvidia")]
+#[derive(Serialize)]
+struct AuxPowerResetRequest {
+    #[serde(rename = "ResetType")]
+    reset_type: &'static str,
+}
+
+#[derive(Serialize)]
+struct PowershelfForceOffRequest {
+    #[serde(rename = "ForceOffType")]
+    force_off_type: &'static str,
+}
+
+#[derive(Serialize)]
+struct PowershelfOnRequest {
+    #[serde(rename = "OnType")]
+    on_type: &'static str,
 }

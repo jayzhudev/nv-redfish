@@ -22,11 +22,19 @@ use crate::NvBmc;
 use crate::Resource;
 use crate::ResourceSchema;
 use nv_redfish_core::Bmc;
+#[cfg(feature = "oem-nvidia")]
+use nv_redfish_core::EntityTypeRef as _;
 use nv_redfish_core::NavProperty;
 use std::sync::Arc;
 
 #[cfg(feature = "sensors")]
+use crate::environment_metrics::EnvironmentMetrics;
+#[cfg(feature = "sensors")]
 use crate::extract_sensor_uris;
+#[cfg(feature = "oem-nvidia")]
+use crate::oem::nvidia::processor::NvidiaMnnvLinkTopology;
+#[cfg(feature = "oem-nvidia")]
+use crate::oem::nvidia::processor::NvidiaWorkloadPowerProfile;
 #[cfg(feature = "sensors")]
 use crate::sensor::extract_environment_sensors;
 #[cfg(feature = "sensors")]
@@ -62,6 +70,22 @@ impl<B: Bmc> Processor<B> {
     #[must_use]
     pub fn raw(&self) -> Arc<ProcessorSchema> {
         self.data.clone()
+    }
+
+    /// Get environment metrics for this processor.
+    ///
+    /// Returns `Ok(None)` when the environment metrics link is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching environment metrics data fails.
+    #[cfg(feature = "sensors")]
+    pub async fn environment_metrics(&self) -> Result<Option<EnvironmentMetrics<B>>, Error<B>> {
+        if let Some(env_ref) = &self.data.environment_metrics {
+            EnvironmentMetrics::new(&self.bmc, env_ref).await.map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get processor metrics.
@@ -133,6 +157,35 @@ impl<B: Bmc> Processor<B> {
             .into_iter()
             .map(|r| SensorLink::new(&self.bmc, r))
             .collect())
+    }
+
+    /// Get NVIDIA MNNVLink topology data for this processor.
+    ///
+    /// Returns `Ok(None)` when the processor has no NVIDIA MNNVLink topology OEM data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the NVIDIA OEM data cannot be parsed.
+    #[cfg(feature = "oem-nvidia")]
+    pub fn nvidia_mnnvlink_topology(&self) -> Result<Option<NvidiaMnnvLinkTopology>, Error<B>> {
+        self.data
+            .base
+            .base
+            .oem
+            .as_ref()
+            .map_or_else(|| Ok(None), NvidiaMnnvLinkTopology::from_resource_oem)
+    }
+
+    /// Get the NVIDIA workload power profile resource for this processor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching workload power profile data fails.
+    #[cfg(feature = "oem-nvidia")]
+    pub async fn nvidia_workload_power_profile(
+        &self,
+    ) -> Result<NvidiaWorkloadPowerProfile<B>, Error<B>> {
+        NvidiaWorkloadPowerProfile::new(&self.bmc, self.data.odata_id()).await
     }
 }
 

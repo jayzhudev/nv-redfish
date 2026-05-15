@@ -33,5 +33,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Vendor: {:?}", root.vendor());
     println!("Product: {:?}", root.product());
     println!("Redfish version: {:?}", root.redfish_version());
+
     Ok(())
 }

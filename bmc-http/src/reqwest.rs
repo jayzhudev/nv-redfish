@@ -18,6 +18,17 @@
 use crate::BmcCredentials;
 use crate::CacheableError;
 use crate::HttpClient;
+use crate::MultipartHttpClient;
+use crate::MultipartUploadFile;
+use crate::MultipartUploadReader;
+use crate::MultipartUploadResponse;
+use crate::RawFileUploadHttpClient;
+use crate::RawJsonHttpClient;
+use crate::RawUploadResponse;
+use crate::RedfishUriError;
+use crate::UploadError;
+use crate::UploadFile;
+use crate::UploadReader;
 use futures_util::StreamExt as _;
 use http::header;
 use http::HeaderMap;
@@ -27,6 +38,8 @@ use nv_redfish_core::ModificationResponse;
 use nv_redfish_core::ODataETag;
 use nv_redfish_core::ODataId;
 use nv_redfish_core::SessionCreateResponse;
+use reqwest::multipart::Form;
+use reqwest::multipart::Part;
 use reqwest::redirect::Policy as RedirectPolicy;
 use reqwest::Client as ReqwestClient;
 use reqwest::Error as ReqwestError;
@@ -34,8 +47,18 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::error::Error as StdError;
 use std::fmt;
+use std::io;
+use std::path::Path;
 use std::time::Duration;
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 use url::Url;
+
+const JSON_MIME: &str = "application/json";
+const OCTET_STREAM_MIME: &str = "application/octet-stream";
+const UNREADABLE_ERROR_BODY: &str = "<no data>";
+const UPDATE_FILE_PART_NAME: &str = "UpdateFile";
+const UPDATE_PARAMETERS_PART_NAME: &str = "UpdateParameters";
 
 /// Errors of reqwest implementation of the HTTP trait.
 #[derive(Debug)]
@@ -59,6 +82,8 @@ pub enum BmcError {
     CacheMiss,
     /// HTTP cache error.
     CacheError(String),
+    /// Caller supplied URI failed Redfish endpoint validation.
+    InvalidRedfishUri(RedfishUriError),
     /// JSON deserialization error.
     DecodeError(serde_json::Error),
 }
@@ -86,6 +111,12 @@ impl CacheableError for BmcError {
     }
 }
 
+impl From<RedfishUriError> for BmcError {
+    fn from(error: RedfishUriError) -> Self {
+        Self::InvalidRedfishUri(error)
+    }
+}
+
 impl fmt::Display for BmcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -98,6 +129,7 @@ impl fmt::Display for BmcError {
             }
             Self::CacheMiss => write!(f, "Resource not found in cache"),
             Self::CacheError(r) => write!(f, "Error occurred in cache {r:?}"),
+            Self::InvalidRedfishUri(e) => write!(f, "Invalid Redfish URI: {e}"),
             Self::JsonError(e) => write!(
                 f,
                 "JSON deserialization error at line {} column {} path {}: {e}",
@@ -117,6 +149,7 @@ impl StdError for BmcError {
             Self::ReqwestError(e) => Some(e),
             Self::JsonError(e) => Some(e.inner()),
             Self::SseStreamError(e) => Some(e),
+            Self::InvalidRedfishUri(e) => Some(e),
             Self::DecodeError(e) => Some(e),
             _ => None,
         }
@@ -342,6 +375,67 @@ impl Client {
     }
 }
 
+impl crate::HttpBmc<Client> {
+    /// POST a Redfish UpdateService multipart upload with `UpdateFile` read from a file path.
+    ///
+    /// The request reuses this BMC's HTTP client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, the multipart body cannot be
+    /// built, the request fails, or the BMC returns an unsuccessful HTTP status.
+    pub async fn post_update_multipart_from_path<P, V>(
+        &self,
+        multipart_uri: &str,
+        update_parameters: &V,
+        update_file: P,
+        upload_timeout: Duration,
+    ) -> Result<MultipartUploadResponse, UploadError<BmcError>>
+    where
+        P: AsRef<Path>,
+        V: Serialize + Send + Sync,
+    {
+        let update_file = multipart_upload_file_from_path(update_file.as_ref())
+            .await
+            .map_err(UploadError::File)?;
+
+        self.post_update_multipart_file(
+            multipart_uri,
+            update_parameters,
+            update_file,
+            upload_timeout,
+        )
+        .await
+        .map_err(UploadError::Request)
+    }
+
+    /// PUT a raw Redfish update file read from a file path.
+    ///
+    /// The request reuses this BMC's HTTP client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, the request fails, or the
+    /// BMC returns an unsuccessful HTTP status.
+    pub async fn put_update_file_from_path<P>(
+        &self,
+        update_uri: &str,
+        update_file: P,
+        upload_timeout: Duration,
+    ) -> Result<RawUploadResponse, UploadError<BmcError>>
+    where
+        P: AsRef<Path>,
+    {
+        let update_file = upload_file_from_path(update_file.as_ref())
+            .await
+            .map_err(UploadError::File)?;
+
+        self.put_update_file(update_uri, update_file, upload_timeout)
+            .await
+            .map_err(UploadError::Request)
+    }
+}
+
 impl Client {
     async fn handle_response<T>(&self, response: reqwest::Response) -> Result<T, BmcError>
     where
@@ -351,7 +445,10 @@ impl Client {
             return Err(BmcError::InvalidResponse {
                 url: response.url().clone(),
                 status: response.status(),
-                text: response.text().await.unwrap_or_else(|_| "<no data>".into()),
+                text: response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| UNREADABLE_ERROR_BODY.into()),
             });
         }
 
@@ -368,6 +465,29 @@ impl Client {
         serde_path_to_error::deserialize(value).map_err(BmcError::JsonError)
     }
 
+    async fn handle_json_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<serde_json::Value, BmcError> {
+        let status = response.status();
+        let url = response.url().clone();
+
+        if !status.is_success() {
+            return Err(BmcError::InvalidResponse {
+                url,
+                status,
+                text: response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| UNREADABLE_ERROR_BODY.into()),
+            });
+        }
+
+        let bytes = response.bytes().await.map_err(BmcError::ReqwestError)?;
+
+        json_value_from_bytes(&bytes)
+    }
+
     async fn handle_modification_response<T>(
         &self,
         response: reqwest::Response,
@@ -382,7 +502,10 @@ impl Client {
             return Err(BmcError::InvalidResponse {
                 url,
                 status,
-                text: response.text().await.unwrap_or_else(|_| "<no data>".into()),
+                text: response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| UNREADABLE_ERROR_BODY.into()),
             });
         }
 
@@ -399,6 +522,7 @@ impl Client {
                         text: String::from("202 Accepted without Location header"),
                     });
                 };
+
                 Ok(ModificationResponse::Task(AsyncTask {
                     id: task_monitor_id,
                     retry_after_secs: retry_after_from_headers(&headers),
@@ -406,23 +530,14 @@ impl Client {
             }
             reqwest::StatusCode::OK | reqwest::StatusCode::CREATED => {
                 let bytes = response.bytes().await.map_err(BmcError::ReqwestError)?;
-                if !bytes.is_empty() {
-                    let value: serde_json::Value =
-                        serde_json::from_slice(&bytes).map_err(BmcError::DecodeError)?;
-                    let mut value = value;
 
-                    if value.get("@odata.id").is_some() {
-                        if let Some(etag) = etag {
-                            inject_etag(&etag, &mut value);
-                        }
-                        return serde_path_to_error::deserialize(value)
-                            .map(ModificationResponse::Entity)
-                            .map_err(BmcError::JsonError);
-                    }
+                if let Some(entity) = modification_entity_from_odata_body(&bytes, etag.as_ref())? {
+                    return Ok(entity);
                 }
 
                 if let Some(location) = location {
                     let value = serde_json::json!({ "@odata.id": location });
+
                     return serde_path_to_error::deserialize(value)
                         .map(ModificationResponse::Entity)
                         .map_err(BmcError::JsonError);
@@ -452,7 +567,10 @@ impl Client {
             return Err(BmcError::InvalidResponse {
                 url,
                 status,
-                text: response.text().await.unwrap_or_else(|_| "<no data>".into()),
+                text: response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| UNREADABLE_ERROR_BODY.into()),
             });
         }
 
@@ -516,6 +634,153 @@ impl Client {
     }
 }
 
+fn update_multipart_form<R, V>(
+    update_parameters: &V,
+    update_file: MultipartUploadFile<R>,
+) -> Result<Form, BmcError>
+where
+    R: MultipartUploadReader,
+    V: Serialize + Send + Sync,
+{
+    let update_parameters_json =
+        serde_json::to_vec(update_parameters).map_err(BmcError::DecodeError)?;
+
+    let update_parameters_part = part_with_mime(Part::bytes(update_parameters_json), JSON_MIME)?;
+
+    let (file_name, reader, content_length) = update_file.into_parts();
+    let body = reqwest::Body::wrap_stream(ReaderStream::new(reader));
+    let file_part = match content_length {
+        Some(length) => Part::stream_with_length(body, length),
+        None => Part::stream(body),
+    };
+
+    let file_part = part_with_mime(file_part.file_name(file_name), OCTET_STREAM_MIME)?;
+
+    Ok(Form::new()
+        .part(UPDATE_PARAMETERS_PART_NAME, update_parameters_part)
+        .part(UPDATE_FILE_PART_NAME, file_part))
+}
+
+fn raw_upload_body<R>(update_file: UploadFile<R>) -> (reqwest::Body, Option<u64>)
+where
+    R: UploadReader,
+{
+    let (reader, content_length) = update_file.into_parts();
+    let body = reqwest::Body::wrap_stream(ReaderStream::new(reader));
+
+    (body, content_length)
+}
+
+async fn handle_upload_response(
+    response: reqwest::Response,
+) -> Result<MultipartUploadResponse, BmcError> {
+    let status = response.status();
+    let url = response.url().clone();
+    let headers = response.headers().clone();
+
+    if !status.is_success() {
+        #[allow(clippy::unnecessary_result_map_or_else)]
+        let text = response
+            .text()
+            .await
+            .map_or_else(|_| UNREADABLE_ERROR_BODY.into(), |text| text);
+
+        return Err(BmcError::InvalidResponse { url, status, text });
+    }
+
+    let bytes = response.bytes().await.map_err(BmcError::ReqwestError)?;
+    let body = if bytes.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(&bytes).map_err(BmcError::DecodeError)?)
+    };
+
+    let odata_id = body.as_ref().and_then(odata_id_from_body);
+
+    Ok(MultipartUploadResponse {
+        status: status.as_u16(),
+        location: location_from_headers(&headers),
+        odata_id,
+        retry_after_secs: retry_after_from_headers(&headers),
+        body,
+    })
+}
+
+async fn multipart_upload_file_from_path(
+    path: &Path,
+) -> Result<MultipartUploadFile<File>, io::Error> {
+    let (file_name, file, length) = upload_file_parts_from_path(path).await?;
+
+    Ok(MultipartUploadFile::new(file_name, file).with_content_length(length))
+}
+
+async fn upload_file_from_path(path: &Path) -> Result<UploadFile<File>, io::Error> {
+    let (_, file, length) = upload_file_parts_from_path(path).await?;
+
+    Ok(UploadFile::new(file).with_content_length(length))
+}
+
+async fn upload_file_parts_from_path(path: &Path) -> Result<(String, File, u64), io::Error> {
+    let file_name = file_name_from_path(path);
+    let file = File::open(path).await?;
+
+    let length = file.metadata().await?.len();
+
+    Ok((file_name, file, length))
+}
+
+fn odata_id_from_body(body: &serde_json::Value) -> Option<ODataId> {
+    body.get("@odata.id")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| id.to_string().into())
+}
+
+fn modification_entity_from_odata_body<T>(
+    bytes: &[u8],
+    etag: Option<&ODataETag>,
+) -> Result<Option<ModificationResponse<T>>, BmcError>
+where
+    T: DeserializeOwned + Send + Sync,
+{
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(BmcError::DecodeError)?;
+
+    if value.get("@odata.id").is_none() {
+        return Ok(None);
+    }
+
+    if let Some(etag) = etag {
+        inject_etag(etag, &mut value);
+    }
+
+    serde_path_to_error::deserialize(value)
+        .map(ModificationResponse::Entity)
+        .map(Some)
+        .map_err(BmcError::JsonError)
+}
+
+fn json_value_from_bytes(bytes: &[u8]) -> Result<serde_json::Value, BmcError> {
+    if bytes.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    serde_json::from_slice(bytes).map_err(BmcError::DecodeError)
+}
+
+fn file_name_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .map_or_else(|| "update.bin".to_string(), ToString::to_string)
+}
+
+fn part_with_mime(part: Part, mime: &'static str) -> Result<Part, BmcError> {
+    part.mime_str(mime).map_err(BmcError::ReqwestError)
+}
+
 fn location_from_headers(headers: &HeaderMap) -> Option<ODataId> {
     headers
         .get(header::LOCATION)
@@ -572,10 +837,69 @@ fn auth_headers(
     credentials: &BmcCredentials,
 ) -> reqwest::RequestBuilder {
     match credentials {
+        BmcCredentials::UsernamePassword { username, .. } if username.is_empty() => request,
         BmcCredentials::UsernamePassword { username, password } => {
             request.basic_auth(username, password.as_ref())
         }
         BmcCredentials::Token { token } => request.header("X-Auth-Token", token),
+    }
+}
+
+impl RawJsonHttpClient for Client {
+    async fn get_json(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> Result<serde_json::Value, Self::Error> {
+        let response = auth_headers(self.client.get(url), credentials)
+            .headers(custom_headers.clone())
+            .send()
+            .await?;
+
+        self.handle_json_response(response).await
+    }
+
+    async fn post_json<B>(
+        &self,
+        url: Url,
+        body: &B,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> Result<serde_json::Value, Self::Error>
+    where
+        B: Serialize + Send + Sync,
+    {
+        let response = auth_headers(self.client.post(url), credentials)
+            .headers(custom_headers.clone())
+            .json(body)
+            .send()
+            .await?;
+
+        self.handle_json_response(response).await
+    }
+
+    async fn patch_json<B>(
+        &self,
+        url: Url,
+        etag: Option<&ODataETag>,
+        body: &B,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> Result<serde_json::Value, Self::Error>
+    where
+        B: Serialize + Send + Sync,
+    {
+        let mut request =
+            auth_headers(self.client.patch(url), credentials).headers(custom_headers.clone());
+
+        if let Some(etag) = etag {
+            request = request.header(header::IF_MATCH, etag.to_string());
+        }
+
+        let response = request.json(body).send().await?;
+
+        self.handle_json_response(response).await
     }
 }
 
@@ -600,6 +924,7 @@ impl HttpClient for Client {
         }
 
         let response = request.send().await?;
+
         self.handle_response(response).await
     }
 
@@ -655,12 +980,13 @@ impl HttpClient for Client {
         B: Serialize + Send + Sync,
         T: DeserializeOwned + Send + Sync,
     {
-        let mut request =
-            auth_headers(self.client.patch(url), credentials).headers(custom_headers.clone());
+        let response = auth_headers(self.client.patch(url), credentials)
+            .headers(custom_headers.clone())
+            .header(header::IF_MATCH, etag.to_string())
+            .json(body)
+            .send()
+            .await?;
 
-        request = request.header(header::IF_MATCH, etag.to_string());
-
-        let response = request.json(body).send().await?;
         self.handle_modification_response(response).await
     }
 
@@ -698,7 +1024,10 @@ impl HttpClient for Client {
             return Err(BmcError::InvalidResponse {
                 url: response.url().clone(),
                 status: response.status(),
-                text: response.text().await.unwrap_or_else(|_| "<no data>".into()),
+                text: response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| UNREADABLE_ERROR_BODY.into()),
             });
         }
 
@@ -720,22 +1049,77 @@ impl HttpClient for Client {
     }
 }
 
+impl MultipartHttpClient for Client {
+    async fn post_multipart_update<R, V>(
+        &self,
+        url: Url,
+        update_parameters: &V,
+        update_file: MultipartUploadFile<R>,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        upload_timeout: Duration,
+    ) -> Result<MultipartUploadResponse, Self::Error>
+    where
+        R: MultipartUploadReader,
+        V: Serialize + Send + Sync,
+    {
+        let form = update_multipart_form(update_parameters, update_file)?;
+
+        let response = auth_headers(self.client.post(url), credentials)
+            .headers(custom_headers.clone())
+            .multipart(form)
+            .timeout(upload_timeout)
+            .send()
+            .await?;
+
+        handle_upload_response(response).await
+    }
+}
+
+impl RawFileUploadHttpClient for Client {
+    async fn put_raw_update<R>(
+        &self,
+        url: Url,
+        update_file: UploadFile<R>,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        upload_timeout: Duration,
+    ) -> Result<RawUploadResponse, Self::Error>
+    where
+        R: UploadReader,
+    {
+        let (body, content_length) = raw_upload_body(update_file);
+
+        let mut request = auth_headers(self.client.put(url), credentials)
+            .headers(custom_headers.clone())
+            .header(header::CONTENT_TYPE, OCTET_STREAM_MIME)
+            .body(body)
+            .timeout(upload_timeout);
+
+        if let Some(content_length) = content_length {
+            request = request.header(header::CONTENT_LENGTH, content_length);
+        }
+
+        let response = request.send().await?;
+
+        handle_upload_response(response).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn test_cacheable_error_trait() {
-        let mock_response = reqwest::Response::from(
-            http::Response::builder()
-                .status(304)
-                .body("")
-                .expect("Valid empty body"),
-        );
+    fn test_cacheable_error_trait() -> Result<(), Box<dyn StdError>> {
+        let mock_response =
+            reqwest::Response::from(http::Response::builder().status(304).body("")?);
         let error = BmcError::InvalidResponse {
-            url: "http://example.com/redfish/v1".parse().unwrap(),
+            url: "http://example.com/redfish/v1".parse()?,
             status: mock_response.status(),
-            text: "".into(),
+            text: String::new(),
         };
+
         assert!(error.is_cached());
 
         let cache_miss = BmcError::CacheMiss;
@@ -743,5 +1127,7 @@ mod tests {
 
         let created_miss = BmcError::cache_miss();
         assert!(matches!(created_miss, BmcError::CacheMiss));
+
+        Ok(())
     }
 }

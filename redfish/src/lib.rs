@@ -103,6 +103,9 @@ pub mod update_service;
 
 #[cfg(feature = "assembly")]
 pub mod assembly;
+/// Environment metrics.
+#[cfg(feature = "sensors")]
+pub mod environment_metrics;
 /// Ethernet interfaces.
 #[cfg(feature = "ethernet-interfaces")]
 pub mod ethernet_interface;
@@ -126,6 +129,9 @@ pub mod sensor;
 /// Session Service.
 #[cfg(feature = "session-service")]
 pub mod session_service;
+/// Task polling support.
+#[cfg(feature = "task-service")]
+pub mod task;
 /// Telemetry Service.
 #[cfg(feature = "telemetry-service")]
 pub mod telemetry_service;

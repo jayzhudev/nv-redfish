@@ -74,7 +74,7 @@ Common feature groups:
   `host-interfaces`, `log-services`, `managers`, `memory`,
   `network-adapters`, `network-device-functions`, `pcie-devices`, `power`,
   `power-supplies`, `processors`, `secure-boot`, `sensors`,
-  `session-service`, `storages`, `telemetry-service`, `thermal`,
+  `session-service`, `storages`, `task-service`, `telemetry-service`, `thermal`,
   `update-service`.
 - OEM features: `oem-ami`, `oem-dell`, `oem-hpe`, `oem-lenovo`,
   `oem-supermicro`, `oem-nvidia`, `oem-liteon`.
@@ -125,6 +125,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 See `examples/readme-minimal` for this example as a workspace target.
 See `examples/session-token` for Redfish SessionService authentication using
 `X-Auth-Token`.
+
+## Generic Redfish Passthrough
+
+Typed service wrappers should be preferred for normal application code. The
+generic JSON passthrough exists for callers that must proxy arbitrary Redfish
+traffic, such as an RMS gRPC API that exposes vendor or newly introduced BMC
+resources before `nv-redfish` has typed schema support.
+
+Keeping this passthrough in `nv-redfish-bmc-http` lets those callers reuse the
+same BMC credentials, custom headers, shared reqwest client, URI handling, and
+HTTP error behavior as typed `nv-redfish` calls. That avoids one-off direct
+reqwest code in applications while preserving exact successful JSON responses,
+including OEM payloads and responses without `@odata.id`.
+
+Example, assuming the `bmc` value from the minimal example and a `serde_json`
+dependency:
+
+```rust
+use serde_json::json;
+
+let _inventory = bmc
+    .get_json("/redfish/v1/Managers/BMC/Oem/Nvidia/Inventory?$expand=*")
+    .await?;
+
+let request = json!({
+    "Oem": {
+        "Nvidia": {
+            "MaintenanceMode": true
+        }
+    }
+});
+
+let _response = bmc
+    .patch_json(
+        "/redfish/v1/Managers/BMC/Oem/Nvidia/Settings",
+        None,
+        &request,
+    )
+    .await?;
+```
 
 ## How It Fits Together
 

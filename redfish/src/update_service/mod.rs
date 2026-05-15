@@ -30,20 +30,155 @@ use crate::NvBmc;
 use crate::Resource;
 use crate::ResourceSchema;
 use crate::ServiceRoot;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::reqwest::Client as ReqwestClient;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::CacheableError;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::HttpBmc;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::MultipartHttpClient;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::MultipartUploadReader;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::RawFileUploadHttpClient;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::RedfishUriError;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::UploadError;
+#[cfg(feature = "bmc-http")]
+use nv_redfish_bmc_http::UploadReader;
 use nv_redfish_core::Bmc;
 use nv_redfish_core::ModificationResponse;
 use serde_json::Value as JsonValue;
 use software_inventory::SoftwareInventoryCollection;
+#[cfg(feature = "bmc-http")]
+use std::error::Error as StdError;
+#[cfg(feature = "bmc-http")]
+use std::fmt;
+#[cfg(feature = "bmc-http")]
+use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "bmc-http")]
+use std::time::Duration;
 
 #[doc(inline)]
 pub use crate::schema::update_service::TransferProtocolType;
+#[cfg(feature = "bmc-http")]
+#[doc(inline)]
+pub use nv_redfish_bmc_http::MultipartUploadResponse as MultipartUpdateResponse;
+#[cfg(feature = "bmc-http")]
+#[doc(inline)]
+pub use nv_redfish_bmc_http::RawUploadResponse as RawUpdateResponse;
 #[doc(inline)]
 pub use software_inventory::SoftwareInventory;
 #[doc(inline)]
 pub use software_inventory::Version;
 #[doc(inline)]
 pub use software_inventory::VersionRef;
+
+/// Common Redfish UpdateService multipart upload URI.
+#[cfg(feature = "bmc-http")]
+pub const UPDATE_MULTIPART_URI: &str = "/redfish/v1/UpdateService/update-multipart";
+
+/// Common Redfish UpdateService raw file upload URI.
+#[cfg(feature = "bmc-http")]
+pub const UPDATE_URI: &str = "/redfish/v1/UpdateService/update";
+
+#[cfg(feature = "bmc-http")]
+const FORCE_UPDATE_PARAMETER: &str = "ForceUpdate";
+#[cfg(feature = "bmc-http")]
+const TARGETS_PARAMETER: &str = "Targets";
+
+/// Typed `UpdateParameters` part for Redfish UpdateService multipart uploads.
+#[cfg(feature = "bmc-http")]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct MultipartUpdateParameters {
+    /// Force the update even when the service would otherwise reject it by policy.
+    #[serde(rename = "ForceUpdate")]
+    pub force_update: bool,
+    /// Redfish target resource URIs to update.
+    #[serde(rename = "Targets")]
+    pub targets: Vec<String>,
+    /// Additional Redfish or vendor-specific update parameters.
+    ///
+    /// Use [`Self::with_parameter`] to add entries without colliding with typed
+    /// `ForceUpdate` or `Targets` fields.
+    #[serde(flatten)]
+    additional_parameters: serde_json::Map<String, JsonValue>,
+}
+
+#[cfg(feature = "bmc-http")]
+impl MultipartUpdateParameters {
+    /// Create update parameters with the required Redfish fields.
+    #[must_use]
+    pub fn new(force_update: bool, targets: Vec<String>) -> Self {
+        Self {
+            force_update,
+            targets,
+            additional_parameters: serde_json::Map::new(),
+        }
+    }
+
+    /// Add an extra update parameter to the JSON body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is a typed field already represented by this
+    /// struct.
+    pub fn with_parameter(
+        mut self,
+        name: impl Into<String>,
+        value: JsonValue,
+    ) -> Result<Self, MultipartUpdateParameterError> {
+        let name = name.into();
+
+        if is_reserved_update_parameter(&name) {
+            return Err(MultipartUpdateParameterError { name });
+        }
+
+        self.additional_parameters.insert(name, value);
+
+        Ok(self)
+    }
+
+    /// Additional Redfish or vendor-specific update parameters.
+    #[must_use]
+    pub const fn additional_parameters(&self) -> &serde_json::Map<String, JsonValue> {
+        &self.additional_parameters
+    }
+}
+
+/// Error returned when an additional update parameter duplicates a typed field.
+#[cfg(feature = "bmc-http")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUpdateParameterError {
+    name: String,
+}
+
+#[cfg(feature = "bmc-http")]
+impl MultipartUpdateParameterError {
+    /// The rejected parameter name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(feature = "bmc-http")]
+impl fmt::Display for MultipartUpdateParameterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "reserved update parameter name: {}", self.name)
+    }
+}
+
+#[cfg(feature = "bmc-http")]
+impl StdError for MultipartUpdateParameterError {}
+
+#[cfg(feature = "bmc-http")]
+fn is_reserved_update_parameter(name: &str) -> bool {
+    matches!(name, FORCE_UPDATE_PARAMETER | TARGETS_PARAMETER)
+}
 
 /// Update service.
 ///
@@ -247,6 +382,137 @@ impl<B: Bmc> UpdateService<B> {
     }
 }
 
+#[cfg(feature = "bmc-http")]
+impl UpdateService<HttpBmc<ReqwestClient>> {
+    /// Perform a multipart update upload with `UpdateFile` read from a file path.
+    ///
+    /// The request posts to the caller supplied multipart URI and reuses the BMC's
+    /// reqwest client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, the multipart request fails,
+    /// or the BMC returns an unsuccessful HTTP status.
+    pub async fn multipart_update_from_path<P>(
+        &self,
+        multipart_uri: impl AsRef<str>,
+        update_parameters: &MultipartUpdateParameters,
+        update_file: P,
+        upload_timeout: Duration,
+    ) -> Result<MultipartUpdateResponse, UploadError<Error<HttpBmc<ReqwestClient>>>>
+    where
+        P: AsRef<Path>,
+    {
+        self.bmc
+            .as_ref()
+            .post_update_multipart_from_path(
+                multipart_uri.as_ref(),
+                update_parameters,
+                update_file,
+                upload_timeout,
+            )
+            .await
+            .map_err(|err| err.map_request(Error::Bmc))
+    }
+
+    /// Perform a raw file update upload with the file read from a file path.
+    ///
+    /// The request uses HTTP PUT with an `application/octet-stream` body and
+    /// reuses the BMC's reqwest client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, the upload request fails,
+    /// or the BMC returns an unsuccessful HTTP status.
+    pub async fn raw_update_from_path<P>(
+        &self,
+        update_uri: impl AsRef<str>,
+        update_file: P,
+        upload_timeout: Duration,
+    ) -> Result<RawUpdateResponse, UploadError<Error<HttpBmc<ReqwestClient>>>>
+    where
+        P: AsRef<Path>,
+    {
+        self.bmc
+            .as_ref()
+            .put_update_file_from_path(update_uri.as_ref(), update_file, upload_timeout)
+            .await
+            .map_err(|err| err.map_request(Error::Bmc))
+    }
+}
+
+#[cfg(feature = "bmc-http")]
+impl<C> UpdateService<HttpBmc<C>>
+where
+    C: MultipartHttpClient,
+    C::Error: CacheableError + From<RedfishUriError> + StdError + Send + Sync,
+{
+    /// Perform a multipart update upload with `UpdateFile` read from an async reader.
+    ///
+    /// The request posts to the caller supplied multipart URI and reuses the BMC's
+    /// HTTP client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the multipart request fails or the BMC returns an
+    /// unsuccessful HTTP status.
+    pub async fn multipart_update_from_reader<R>(
+        &self,
+        multipart_uri: impl AsRef<str>,
+        update_parameters: &MultipartUpdateParameters,
+        file_name: impl Into<String>,
+        update_file: R,
+        upload_timeout: Duration,
+    ) -> Result<MultipartUpdateResponse, Error<HttpBmc<C>>>
+    where
+        R: MultipartUploadReader,
+    {
+        self.bmc
+            .as_ref()
+            .post_update_multipart_from_reader(
+                multipart_uri,
+                update_parameters,
+                file_name,
+                update_file,
+                upload_timeout,
+            )
+            .await
+            .map_err(Error::Bmc)
+    }
+}
+
+#[cfg(feature = "bmc-http")]
+impl<C> UpdateService<HttpBmc<C>>
+where
+    C: RawFileUploadHttpClient,
+    C::Error: CacheableError + From<RedfishUriError> + StdError + Send + Sync,
+{
+    /// Perform a raw file update upload with the file read from an async reader.
+    ///
+    /// The request uses HTTP PUT with an `application/octet-stream` body and
+    /// reuses the BMC's HTTP client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload request fails or the BMC returns an
+    /// unsuccessful HTTP status.
+    pub async fn raw_update_from_reader<R>(
+        &self,
+        update_uri: impl AsRef<str>,
+        update_file: R,
+        upload_timeout: Duration,
+    ) -> Result<RawUpdateResponse, Error<HttpBmc<C>>>
+    where
+        R: UploadReader,
+    {
+        self.bmc
+            .as_ref()
+            .put_update_file_from_reader(update_uri, update_file, upload_timeout)
+            .await
+            .map_err(Error::Bmc)
+    }
+}
+
 impl<B: Bmc> Resource for UpdateService<B> {
     fn resource_ref(&self) -> &ResourceSchema {
         &self.data.as_ref().base
@@ -276,5 +542,45 @@ fn add_default_update_service_name(v: JsonValue) -> JsonValue {
         JsonValue::Object(obj)
     } else {
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "bmc-http")]
+    mod bmc_http {
+        use super::super::*;
+        use serde_json::json;
+
+        type TestResult = Result<(), String>;
+
+        #[test]
+        fn multipart_update_parameters_accept_extra_parameter() -> TestResult {
+            let params = MultipartUpdateParameters::new(false, Vec::new())
+                .with_parameter("ApplyTime", json!("Immediate"))
+                .map_err(|err| err.to_string())?;
+
+            assert_eq!(
+                params.additional_parameters().get("ApplyTime"),
+                Some(&json!("Immediate"))
+            );
+
+            Ok(())
+        }
+
+        #[test]
+        fn multipart_update_parameters_reject_reserved_parameters() -> TestResult {
+            for name in [FORCE_UPDATE_PARAMETER, TARGETS_PARAMETER] {
+                let result = MultipartUpdateParameters::new(false, Vec::new())
+                    .with_parameter(name, json!(true));
+                let Err(err) = result else {
+                    return Err(format!("expected reserved parameter error for {name}"));
+                };
+
+                assert_eq!(err.name(), name);
+            }
+
+            Ok(())
+        }
     }
 }

@@ -20,3 +20,6 @@ pub mod bluefield;
 
 #[cfg(feature = "oem-nvidia-baseboard")]
 pub mod baseboard;
+
+#[cfg(all(feature = "oem-nvidia", feature = "processors"))]
+pub mod processor;

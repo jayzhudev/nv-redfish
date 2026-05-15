@@ -94,6 +94,18 @@ pub struct Action<T, R> {
     _marker_retval: PhantomData<R>,
 }
 
+impl<T, R> Action<T, R> {
+    /// Creates a typed action for a known target URI.
+    #[must_use]
+    pub fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: ActionTarget::new(target.into()),
+            _marker: PhantomData,
+            _marker_retval: PhantomData,
+        }
+    }
+}
+
 /// Action error trait. Needed in generated code when an action function
 /// is called for an action that wasn't specified by the server.
 pub trait ActionError {

@@ -61,13 +61,307 @@ use nv_redfish_core::SessionCreateResponse;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::fmt;
 use std::future::Future;
+#[cfg(feature = "reqwest")]
+use std::io;
 use std::sync::Arc;
 use std::sync::RwLock;
+#[cfg(feature = "reqwest")]
+use std::time::Duration;
+#[cfg(feature = "reqwest")]
+use tokio::io::AsyncRead;
 use url::Url;
 
 #[doc(inline)]
 pub use credentials::BmcCredentials;
+
+/// Error returned when a caller supplied URI is not safe for Redfish use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RedfishUriError {
+    /// Absolute URL does not match the configured BMC endpoint origin.
+    OriginMismatch {
+        /// Requested absolute URI.
+        uri: String,
+    },
+    /// URI path is outside the Redfish service root.
+    NonRedfishPath {
+        /// Requested URI path.
+        path: String,
+    },
+    /// URI path contains a `.` or `..` segment.
+    DotSegment {
+        /// Requested URI path.
+        path: String,
+    },
+}
+
+impl fmt::Display for RedfishUriError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OriginMismatch { uri } => {
+                write!(
+                    f,
+                    "absolute redfish URI origin does not match BMC endpoint: {uri}"
+                )
+            }
+            Self::NonRedfishPath { path } => {
+                write!(
+                    f,
+                    "redfish URI path must be /redfish or start with /redfish/: {path}"
+                )
+            }
+            Self::DotSegment { path } => {
+                write!(f, "redfish URI path must not contain dot segments: {path}")
+            }
+        }
+    }
+}
+
+impl StdError for RedfishUriError {}
+
+/// Error returned by path-based upload helpers.
+#[cfg(feature = "reqwest")]
+#[derive(Debug)]
+pub enum UploadError<E> {
+    /// The upload file could not be opened or inspected.
+    File(io::Error),
+    /// The HTTP upload request failed.
+    Request(E),
+}
+
+#[cfg(feature = "reqwest")]
+impl<E> UploadError<E> {
+    /// Map the request error while preserving file errors.
+    #[must_use]
+    pub fn map_request<T>(self, f: impl FnOnce(E) -> T) -> UploadError<T> {
+        match self {
+            Self::File(err) => UploadError::File(err),
+            Self::Request(err) => UploadError::Request(f(err)),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl<E> fmt::Display for UploadError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(err) => write!(f, "upload file IO error: {err}"),
+            Self::Request(err) => write!(f, "upload request error: {err}"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl<E> StdError for UploadError<E>
+where
+    E: StdError + 'static,
+{
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::File(err) => Some(err),
+            Self::Request(err) => Some(err),
+        }
+    }
+}
+
+/// Async reader type accepted by upload methods.
+#[cfg(feature = "reqwest")]
+pub trait UploadReader: AsyncRead + Send + 'static {}
+
+#[cfg(feature = "reqwest")]
+impl<T> UploadReader for T where T: AsyncRead + Send + 'static {}
+
+/// File stream and metadata for a Redfish upload.
+#[cfg(feature = "reqwest")]
+pub struct UploadFile<R: UploadReader> {
+    reader: R,
+    content_length: Option<u64>,
+}
+
+#[cfg(feature = "reqwest")]
+impl<R: UploadReader> UploadFile<R> {
+    /// Create an upload file from an async reader.
+    #[must_use]
+    pub const fn new(reader: R) -> Self {
+        Self {
+            reader,
+            content_length: None,
+        }
+    }
+
+    /// Attach a known content length for transports that can use it.
+    #[must_use]
+    pub const fn with_content_length(mut self, content_length: u64) -> Self {
+        self.content_length = Some(content_length);
+
+        self
+    }
+
+    /// Split the upload file into transport-owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (R, Option<u64>) {
+        (self.reader, self.content_length)
+    }
+}
+
+/// Async reader type accepted by multipart upload methods.
+#[cfg(feature = "reqwest")]
+pub trait MultipartUploadReader: UploadReader {}
+
+#[cfg(feature = "reqwest")]
+impl<T> MultipartUploadReader for T where T: UploadReader {}
+
+/// `UpdateFile` stream and metadata for a Redfish multipart upload.
+#[cfg(feature = "reqwest")]
+pub struct MultipartUploadFile<R: MultipartUploadReader> {
+    file_name: String,
+    reader: R,
+    content_length: Option<u64>,
+}
+
+#[cfg(feature = "reqwest")]
+impl<R: MultipartUploadReader> MultipartUploadFile<R> {
+    /// Create a multipart upload file from a file name and async reader.
+    #[must_use]
+    pub const fn new(file_name: String, reader: R) -> Self {
+        Self {
+            file_name,
+            reader,
+            content_length: None,
+        }
+    }
+
+    /// Attach a known content length for transports that can use it.
+    #[must_use]
+    pub const fn with_content_length(mut self, content_length: u64) -> Self {
+        self.content_length = Some(content_length);
+
+        self
+    }
+
+    /// Split the upload file into transport-owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (String, R, Option<u64>) {
+        (self.file_name, self.reader, self.content_length)
+    }
+}
+
+/// Structured response from a Redfish multipart upload request.
+#[cfg(feature = "reqwest")]
+#[derive(Debug, Clone)]
+pub struct MultipartUploadResponse {
+    /// HTTP status code returned by the BMC.
+    pub status: u16,
+    /// `Location` header, usually a Redfish task monitor URI for 202 responses.
+    pub location: Option<ODataId>,
+    /// Response body `@odata.id`, when the BMC returns a Redfish resource body.
+    pub odata_id: Option<ODataId>,
+    /// Recommended task polling delay from the `Retry-After` header.
+    pub retry_after_secs: Option<u64>,
+    /// Parsed JSON response body for caller-specific response details.
+    pub body: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "reqwest")]
+impl MultipartUploadResponse {
+    /// Best available task URI.
+    ///
+    /// Body `@odata.id` is preferred because a 202 `Location` can point to a
+    /// task monitor rather than the task resource itself.
+    #[must_use]
+    pub fn task_uri(&self) -> Option<&ODataId> {
+        self.odata_id.as_ref().or(self.location.as_ref())
+    }
+
+    /// Best available task id, derived from [`Self::task_uri`].
+    #[must_use]
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_uri().and_then(ODataId::last_segment)
+    }
+}
+
+/// Alias for a Redfish raw file upload response.
+#[cfg(feature = "reqwest")]
+pub type RawUploadResponse = MultipartUploadResponse;
+
+/// HTTP client extension for Redfish multipart uploads.
+#[cfg(feature = "reqwest")]
+pub trait MultipartHttpClient: HttpClient {
+    /// Perform a Redfish UpdateService multipart upload POST request.
+    fn post_multipart_update<R, V>(
+        &self,
+        url: Url,
+        update_parameters: &V,
+        update_file: MultipartUploadFile<R>,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        upload_timeout: Duration,
+    ) -> impl Future<Output = Result<MultipartUploadResponse, Self::Error>> + Send
+    where
+        R: MultipartUploadReader,
+        V: Serialize + Send + Sync;
+}
+
+/// HTTP client extension for Redfish raw file uploads.
+#[cfg(feature = "reqwest")]
+pub trait RawFileUploadHttpClient: HttpClient {
+    /// Perform a Redfish raw file upload PUT request.
+    fn put_raw_update<R>(
+        &self,
+        url: Url,
+        update_file: UploadFile<R>,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+        upload_timeout: Duration,
+    ) -> impl Future<Output = Result<RawUploadResponse, Self::Error>> + Send
+    where
+        R: UploadReader;
+}
+
+/// HTTP client extension for raw JSON Redfish passthrough requests.
+///
+/// These methods are intentionally schema-free for callers that proxy Redfish
+/// resources not modeled by nv-redfish, such as RMS gRPC passthrough, while
+/// still reusing [`HttpBmc`] URL resolution, credentials, and custom headers.
+/// They return `serde_json::Value` so successful bodies without `@odata.id`
+/// are preserved.
+pub trait RawJsonHttpClient: HttpClient {
+    /// Perform an HTTP GET request and return the successful JSON response body.
+    fn get_json(
+        &self,
+        url: Url,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send;
+
+    /// Perform an HTTP POST request and return the successful JSON response body.
+    fn post_json<B>(
+        &self,
+        url: Url,
+        body: &B,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send
+    where
+        B: Serialize + Send + Sync;
+
+    /// Perform an HTTP PATCH request and return the successful JSON response body.
+    fn patch_json<B>(
+        &self,
+        url: Url,
+        etag: Option<&ODataETag>,
+        body: &B,
+        credentials: &BmcCredentials,
+        custom_headers: &HeaderMap,
+    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send
+    where
+        B: Serialize + Send + Sync;
+}
 
 /// HTTP Client trait.
 ///
@@ -178,13 +472,14 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use nv_redfish_bmc_http::HttpBmc;
-    /// use nv_redfish_bmc_http::CacheSettings;
+    /// # #[cfg(feature = "reqwest")]
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// use nv_redfish_bmc_http::BmcCredentials;
+    /// use nv_redfish_bmc_http::CacheSettings;
+    /// use nv_redfish_bmc_http::HttpBmc;
     /// use nv_redfish_bmc_http::reqwest::Client;
     /// use url::Url;
     ///
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let credentials = BmcCredentials::username_password("admin".to_string(), Some("password".to_string()));
     /// let http_client = Client::new()?;
     /// let endpoint = Url::parse("https://192.168.1.100")?;
@@ -229,14 +524,15 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use nv_redfish_bmc_http::HttpBmc;
-    /// use nv_redfish_bmc_http::CacheSettings;
+    /// # #[cfg(feature = "reqwest")]
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use http::HeaderMap;
     /// use nv_redfish_bmc_http::BmcCredentials;
+    /// use nv_redfish_bmc_http::CacheSettings;
+    /// use nv_redfish_bmc_http::HttpBmc;
     /// use nv_redfish_bmc_http::reqwest::Client;
     /// use url::Url;
-    /// use http::HeaderMap;
     ///
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let credentials = BmcCredentials::username_password("admin".to_string(), Some("password".to_string()));
     /// let http_client = Client::new()?;
     /// let endpoint = Url::parse("https://192.168.1.100")?;
@@ -455,6 +751,306 @@ where
     }
 }
 
+impl<C: RawJsonHttpClient> HttpBmc<C>
+where
+    C::Error: CacheableError + From<RedfishUriError> + StdError + Send + Sync,
+{
+    /// GET a raw JSON Redfish passthrough request.
+    ///
+    /// The URI must be a relative Redfish path or an absolute URL that matches
+    /// this BMC endpoint origin.
+    ///
+    /// Empty successful response bodies are returned as `{}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the BMC returns an unsuccessful
+    /// HTTP status, or the successful response body is not valid JSON.
+    pub async fn get_json(&self, uri: impl AsRef<str>) -> Result<serde_json::Value, C::Error> {
+        let endpoint_url =
+            endpoint_url_from_uri(&self.redfish_endpoint, uri.as_ref()).map_err(C::Error::from)?;
+
+        let credentials = self.read_credentials();
+
+        self.client
+            .get_json(endpoint_url, credentials.as_ref(), &self.custom_headers)
+            .await
+    }
+
+    /// POST a raw JSON Redfish passthrough request.
+    ///
+    /// The URI must be a relative Redfish path or an absolute URL that matches
+    /// this BMC endpoint origin.
+    ///
+    /// Empty successful response bodies are returned as `{}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the BMC returns an unsuccessful
+    /// HTTP status, or the successful response body is not valid JSON.
+    pub async fn post_json<B>(
+        &self,
+        uri: impl AsRef<str>,
+        body: &B,
+    ) -> Result<serde_json::Value, C::Error>
+    where
+        B: Serialize + Send + Sync,
+    {
+        let endpoint_url =
+            endpoint_url_from_uri(&self.redfish_endpoint, uri.as_ref()).map_err(C::Error::from)?;
+
+        let credentials = self.read_credentials();
+
+        self.client
+            .post_json(
+                endpoint_url,
+                body,
+                credentials.as_ref(),
+                &self.custom_headers,
+            )
+            .await
+    }
+
+    /// PATCH a raw JSON Redfish passthrough request.
+    ///
+    /// The URI must be a relative Redfish path or an absolute URL that matches
+    /// this BMC endpoint origin.
+    ///
+    /// `If-Match` is sent only when `etag` is `Some`. Empty successful
+    /// response bodies are returned as `{}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the BMC returns an unsuccessful
+    /// HTTP status, or the successful response body is not valid JSON.
+    pub async fn patch_json<B>(
+        &self,
+        uri: impl AsRef<str>,
+        etag: Option<&ODataETag>,
+        body: &B,
+    ) -> Result<serde_json::Value, C::Error>
+    where
+        B: Serialize + Send + Sync,
+    {
+        let endpoint_url =
+            endpoint_url_from_uri(&self.redfish_endpoint, uri.as_ref()).map_err(C::Error::from)?;
+
+        let credentials = self.read_credentials();
+
+        self.client
+            .patch_json(
+                endpoint_url,
+                etag,
+                body,
+                credentials.as_ref(),
+                &self.custom_headers,
+            )
+            .await
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl<C: MultipartHttpClient> HttpBmc<C>
+where
+    C::Error: CacheableError + From<RedfishUriError> + StdError + Send + Sync,
+{
+    /// POST a Redfish UpdateService multipart upload with `UpdateFile` read from an async reader.
+    ///
+    /// The request reuses this BMC's HTTP client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the multipart request fails or the BMC returns an
+    /// unsuccessful HTTP status.
+    pub async fn post_update_multipart_from_reader<R, V>(
+        &self,
+        multipart_uri: impl AsRef<str>,
+        update_parameters: &V,
+        file_name: impl Into<String>,
+        update_file: R,
+        upload_timeout: Duration,
+    ) -> Result<MultipartUploadResponse, C::Error>
+    where
+        R: MultipartUploadReader,
+        V: Serialize + Send + Sync,
+    {
+        let update_file = MultipartUploadFile::new(file_name.into(), update_file);
+
+        self.post_update_multipart_file(
+            multipart_uri,
+            update_parameters,
+            update_file,
+            upload_timeout,
+        )
+        .await
+    }
+
+    /// POST a Redfish UpdateService multipart upload with a pre-built `UpdateFile`.
+    ///
+    /// The request reuses this BMC's HTTP client, credentials, and custom headers.
+    /// The URI must be a relative Redfish path or an absolute URL that matches
+    /// this BMC endpoint origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the multipart request fails or the BMC returns an
+    /// unsuccessful HTTP status.
+    pub async fn post_update_multipart_file<R, V>(
+        &self,
+        multipart_uri: impl AsRef<str>,
+        update_parameters: &V,
+        update_file: MultipartUploadFile<R>,
+        upload_timeout: Duration,
+    ) -> Result<MultipartUploadResponse, C::Error>
+    where
+        R: MultipartUploadReader,
+        V: Serialize + Send + Sync,
+    {
+        let endpoint_url = endpoint_url_from_uri(&self.redfish_endpoint, multipart_uri.as_ref())
+            .map_err(C::Error::from)?;
+
+        let credentials = self.read_credentials();
+
+        self.client
+            .post_multipart_update(
+                endpoint_url,
+                update_parameters,
+                update_file,
+                credentials.as_ref(),
+                &self.custom_headers,
+                upload_timeout,
+            )
+            .await
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl<C: RawFileUploadHttpClient> HttpBmc<C>
+where
+    C::Error: CacheableError + From<RedfishUriError> + StdError + Send + Sync,
+{
+    /// PUT a raw Redfish update file read from an async reader.
+    ///
+    /// The request reuses this BMC's HTTP client, credentials, and custom headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload request fails or the BMC returns an
+    /// unsuccessful HTTP status.
+    pub async fn put_update_file_from_reader<R>(
+        &self,
+        update_uri: impl AsRef<str>,
+        update_file: R,
+        upload_timeout: Duration,
+    ) -> Result<RawUploadResponse, C::Error>
+    where
+        R: UploadReader,
+    {
+        self.put_update_file(update_uri, UploadFile::new(update_file), upload_timeout)
+            .await
+    }
+
+    /// PUT a raw Redfish update file.
+    ///
+    /// The request reuses this BMC's HTTP client, credentials, and custom headers.
+    /// The URI must be a relative Redfish path or an absolute URL that matches
+    /// this BMC endpoint origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload request fails or the BMC returns an
+    /// unsuccessful HTTP status.
+    pub async fn put_update_file<R>(
+        &self,
+        update_uri: impl AsRef<str>,
+        update_file: UploadFile<R>,
+        upload_timeout: Duration,
+    ) -> Result<RawUploadResponse, C::Error>
+    where
+        R: UploadReader,
+    {
+        let endpoint_url = endpoint_url_from_uri(&self.redfish_endpoint, update_uri.as_ref())
+            .map_err(C::Error::from)?;
+
+        let credentials = self.read_credentials();
+
+        self.client
+            .put_raw_update(
+                endpoint_url,
+                update_file,
+                credentials.as_ref(),
+                &self.custom_headers,
+                upload_timeout,
+            )
+            .await
+    }
+}
+
+fn endpoint_url_from_uri(endpoint: &RedfishEndpoint, uri: &str) -> Result<Url, RedfishUriError> {
+    if let Ok(url) = Url::parse(uri) {
+        validate_same_endpoint_origin(endpoint, &url)?;
+        validate_redfish_path(url.path())?;
+
+        return Ok(url);
+    }
+
+    let mut parts = uri.splitn(2, '?');
+    let path = parts.next().map_or(uri, |path| path);
+    let query = parts.next();
+
+    validate_redfish_path(path)?;
+
+    let mut url = endpoint.with_path(path);
+
+    if let Some(query) = query {
+        url.set_query(Some(query));
+    }
+
+    Ok(url)
+}
+
+fn validate_same_endpoint_origin(
+    endpoint: &RedfishEndpoint,
+    url: &Url,
+) -> Result<(), RedfishUriError> {
+    let base_url = Url::from(endpoint);
+    let matches_origin = url.scheme() == base_url.scheme()
+        && url.host_str() == base_url.host_str()
+        && url.port_or_known_default() == base_url.port_or_known_default();
+
+    if matches_origin {
+        Ok(())
+    } else {
+        Err(RedfishUriError::OriginMismatch {
+            uri: url.to_string(),
+        })
+    }
+}
+
+fn validate_redfish_path(path: &str) -> Result<(), RedfishUriError> {
+    if path != "/redfish" && !path.starts_with("/redfish/") {
+        return Err(RedfishUriError::NonRedfishPath {
+            path: path.to_string(),
+        });
+    }
+
+    if path.split('/').any(is_dot_segment) {
+        return Err(RedfishUriError::DotSegment {
+            path: path.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    matches!(segment, "." | "..")
+        || segment.eq_ignore_ascii_case("%2e")
+        || segment.eq_ignore_ascii_case("%2e%2e")
+        || segment.eq_ignore_ascii_case(".%2e")
+        || segment.eq_ignore_ascii_case("%2e.")
+}
+
 impl<C: HttpClient> Bmc for HttpBmc<C>
 where
     C::Error: CacheableError + StdError + Send + Sync,
@@ -515,10 +1111,11 @@ where
         v: &V,
     ) -> Result<ModificationResponse<R>, Self::Error> {
         let endpoint_url = self.redfish_endpoint.with_path(&id.to_string());
+        let credentials = self.read_credentials();
         let etag = etag
             .cloned()
-            .unwrap_or_else(|| ODataETag::from(String::from("*")));
-        let credentials = self.read_credentials();
+            .unwrap_or_else(|| ODataETag::from("*".to_string()));
+
         self.client
             .patch(
                 endpoint_url,

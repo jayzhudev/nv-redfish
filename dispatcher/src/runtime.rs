@@ -30,15 +30,15 @@
 //! [`RuntimeHandle::with_root`] / [`RuntimeHandle::with_root_mut`] share
 //! the same lock, so user mutations and driver steps serialize naturally.
 
+use crate::scheduler::private::SchedulerObj;
+use crate::scheduler::Scheduler;
+use crate::stats::RuntimeStats;
+use crate::work::WorkMeta;
 use crate::Completion;
 use crate::CompletionOutcome;
 use crate::RoutingPath;
 use crate::RuntimeEventType;
 use crate::ScheduledWork;
-use crate::scheduler::Scheduler;
-use crate::scheduler::private::SchedulerObj;
-use crate::stats::RuntimeStats;
-use crate::work::WorkMeta;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
@@ -226,6 +226,9 @@ where
                 }
             }
 
+            // FuturesUnordered only wakes and yields work that can make
+            // progress, avoiding a full scan of all in-flight payloads on
+            // every runtime poll.
             while let Poll::Ready(Some(completed)) = Pin::new(&mut in_flight).poll_next(cx) {
                 let CompletedWork {
                     start,
@@ -448,6 +451,9 @@ struct InFlight<Ev, Err, M: WorkMeta> {
     work: Option<ScheduledWork<FutureWork<Ev, Err>, M>>,
 }
 
+// The payload future is already pinned by FutureWork, so moving this wrapper
+// between polls does not move the inner future. Unpin lets poll take and
+// restore ScheduledWork around the payload poll.
 impl<Ev, Err, M: WorkMeta> Unpin for InFlight<Ev, Err, M> {}
 
 impl<Ev, Err, M: WorkMeta> Future for InFlight<Ev, Err, M> {
@@ -459,9 +465,11 @@ impl<Ev, Err, M: WorkMeta> Future for InFlight<Ev, Err, M> {
             .work
             .take()
             .expect("in-flight work polled after completion");
+
         match work.payload.as_mut().poll(cx) {
             Poll::Pending => {
                 this.work = Some(work);
+
                 Poll::Pending
             }
             Poll::Ready(result) => Poll::Ready(CompletedWork {
@@ -479,4 +487,118 @@ struct CompletedWork<Ev, Err, M> {
     meta: M,
     result: Result<Vec<Ev>, Err>,
     routing: RoutingPath,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Readiness;
+    use futures_util::task::noop_waker_ref;
+
+    type TestResult = Result<(), String>;
+    type TestWork = FutureWork<&'static str, &'static str>;
+
+    struct PendingOnce {
+        polled: bool,
+    }
+
+    impl Future for PendingOnce {
+        type Output = Result<Vec<&'static str>, &'static str>;
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.polled {
+                Poll::Ready(Ok(vec!["done"]))
+            } else {
+                self.polled = true;
+
+                Poll::Pending
+            }
+        }
+    }
+
+    #[test]
+    fn in_flight_keeps_work_after_pending_poll() -> TestResult {
+        let start = Instant::now();
+        let payload: TestWork = Box::pin(PendingOnce { polled: false });
+        let work = ScheduledWork::new(7_u8, payload);
+        let mut in_flight = InFlight {
+            start,
+            work: Some(work),
+        };
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        if Pin::new(&mut in_flight).poll(&mut cx).is_ready() {
+            return Err(String::from("future completed on first poll"));
+        }
+
+        let Poll::Ready(completed) = Pin::new(&mut in_flight).poll(&mut cx) else {
+            return Err(String::from("future stayed pending on second poll"));
+        };
+
+        assert_eq!(completed.start, start);
+        assert_eq!(completed.meta, 7);
+        assert_eq!(completed.result, Ok(vec!["done"]));
+        assert!(completed.routing.is_empty());
+
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct QueueScheduler {
+        work: VecDeque<ScheduledWork<TestWork, u8>>,
+        completions: Vec<Completion<u8>>,
+    }
+
+    impl Scheduler<TestWork> for QueueScheduler {
+        type Meta = u8;
+
+        fn update_ready(&mut self, _: Instant) -> Readiness {
+            if self.work.is_empty() {
+                Readiness::not_ready(None)
+            } else {
+                Readiness::ready(None)
+            }
+        }
+
+        fn take_next(&mut self) -> Option<ScheduledWork<TestWork, Self::Meta>> {
+            self.work.pop_front()
+        }
+
+        fn on_complete(&mut self, completion: Completion<Self::Meta>) {
+            self.completions.push(completion);
+        }
+    }
+
+    #[tokio::test]
+    async fn next_reports_completion_for_finished_work() -> TestResult {
+        let mut scheduler = QueueScheduler::default();
+        let payload: TestWork = Box::pin(async { Ok(vec!["event"]) });
+        scheduler.work.push_back(ScheduledWork::new(11, payload));
+
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                global_max_in_flight: NonZeroUsize::MIN,
+                clock: ClockConfig::Wallclock,
+            },
+            scheduler,
+        );
+
+        let RuntimeOutput::Work { result, .. } = runtime.next().await else {
+            return Err(String::from("runtime did not emit work output"));
+        };
+
+        assert_eq!(result, Ok(vec!["event"]));
+
+        let completions = runtime
+            .handle()
+            .with_root_mut(|root: &mut QueueScheduler| root.completions.clone())
+            .ok_or_else(|| String::from("downcast failed"))?;
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].outcome, CompletionOutcome::Succeeded);
+        assert_eq!(completions[0].meta, 11);
+        assert!(completions[0].routing.is_empty());
+
+        Ok(())
+    }
 }

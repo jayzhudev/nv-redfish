@@ -20,10 +20,14 @@ rigid_arrays = [
 name = "assembly"
 csdl_files = [
     "Assembly_v1.xml",
+    "PhysicalContext_v1.xml",
 ]
 patterns = [
     "Assembly.*",
     "Assembly.*.*",
+]
+root_patterns = [
+    "Assembly.*.Assembly",
 ]
 
 [[features]]
@@ -75,6 +79,10 @@ patterns = [
     "EthernetInterfaceCollection.*",
     "EthernetInterface.*"
 ]
+root_patterns = [
+    "EthernetInterface.*.EthernetInterface",
+    "EthernetInterfaceCollection.EthernetInterfaceCollection",
+]
 rigid_arrays = [
     "EthernetInterface.*.EthernetInterface/StaticNameServers"
 ]
@@ -88,6 +96,10 @@ csdl_files = [
 patterns = [
     "HostInterface.*",
     "HostInterfaceCollection.*",
+]
+root_patterns = [
+    "HostInterface.*.HostInterface",
+    "HostInterfaceCollection.HostInterfaceCollection",
 ]
 
 [[features]]
@@ -120,10 +132,15 @@ csdl_files = [
     "NetworkDeviceFunctionCollection_v1.xml",
     "NetworkDeviceFunction_v1.xml",
     "Protocol_v1.xml",
+    "VLanNetworkInterface_v1.xml",
 ]
 patterns = [
     "NetworkDeviceFunctionCollection.*",
     "NetworkDeviceFunction.*"
+]
+root_patterns = [
+    "NetworkDeviceFunction.*.NetworkDeviceFunction",
+    "NetworkDeviceFunctionCollection.NetworkDeviceFunctionCollection",
 ]
 
 [[features]]
@@ -224,6 +241,12 @@ patterns = [
     "LogEntryCollection.*",
     "Event.*.*"
 ]
+root_patterns = [
+    "LogEntry.*.LogEntry",
+    "LogEntryCollection.LogEntryCollection",
+    "LogService.*.LogService",
+    "LogServiceCollection.LogServiceCollection",
+]
 
 [[features]]
 name = "managers"
@@ -247,15 +270,21 @@ patterns = [
     "PCIeDevice.*",
     "PCIeDeviceCollection.*",
 ]
+root_patterns = [
+    "PCIeDevice.*.PCIeDevice",
+    "PCIeDeviceCollection.PCIeDeviceCollection",
+]
 
 [[features]]
 name = "processors"
 csdl_files = [
+    "PCIeDevice_v1.xml",
     "Processor_v1.xml",
     "ProcessorCollection_v1.xml",
     "ProcessorMetrics_v1.xml",
 ]
 patterns = [
+    "PCIeDevice.PCIeErrors",
     "Processor.*",
     "ProcessorCollection.*",
     "ProcessorMetrics.*",
@@ -291,18 +320,30 @@ patterns = [
 [[features]]
 name = "sensors"
 csdl_files = [
+    "Control_v1.xml",
     "Fan_v1.xml",
     "FanCollection_v1.xml",
+    "PhysicalContext_v1.xml",
+    "Redundancy_v1.xml",
     "Sensor_v1.xml",
     "SensorCollection_v1.xml",
     "EnvironmentMetrics_v1.xml",
 ]
 patterns = [
+    "Control.*",
     "Sensor.*",
     "SensorCollection.*",
     "Fan.*",
     "FanCollection.*",
     "EnvironmentMetrics.*",
+]
+root_patterns = [
+    "Control.*.Control",
+    "EnvironmentMetrics.*.EnvironmentMetrics",
+    "Fan.*.Fan",
+    "FanCollection.FanCollection",
+    "Sensor.*.Sensor",
+    "SensorCollection.SensorCollection",
 ]
 
 [[features]]
@@ -351,6 +392,31 @@ patterns = [
     "Drive.*",
     "DriveCollection.*",
     "DriveMetrics.*",
+]
+
+[[features]]
+name = "task-service"
+csdl_files = [
+    "Task_v1.xml",
+    "TaskCollection_v1.xml",
+    "TaskService_v1.xml",
+]
+patterns = [
+    "Task.*",
+    "TaskCollection.*",
+    "TaskService.*",
+]
+
+[[features]]
+name = "resource-status"
+csdl_files = [
+    "SessionService_v1.xml",
+]
+patterns = [
+    "SessionService.*",
+]
+root_patterns = [
+    "SessionService.*.SessionService",
 ]
 
 [[features]]

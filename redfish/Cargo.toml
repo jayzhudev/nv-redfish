@@ -50,27 +50,28 @@ std-redfish = [
     "sensors",
     "session-service",
     "storages",
+    "task-service",
     "telemetry-service",
     "thermal",
     "update-service",
 ]
 
-assembly = []
+assembly = ["impl-nv-bmc-expand"]
 accounts = ["patch-payload-get", "patch-payload-update", "patch-collection-create"]
 bios = []
 boot-options = []
 chassis = ["patch-payload-get", "patch-collection", "impl-nv-bmc-expand", "impl-entity-link"]
 computer-systems = ["patch-payload-get", "patch-collection"]
-ethernet-interfaces = []
-host-interfaces = []
+ethernet-interfaces = ["impl-nv-bmc-expand"]
+host-interfaces = ["impl-nv-bmc-expand"]
 network-adapters = []
-network-device-functions = []
+network-device-functions = ["impl-nv-bmc-expand"]
 event-service = ["patch"]
-telemetry-service = ["impl-nv-bmc-expand"]
-log-services = []
+telemetry-service = ["impl-nv-bmc-expand", "impl-entity-link"]
+log-services = ["impl-nv-bmc-expand"]
 managers = ["impl-nv-bmc-expand", "patch-collection"]
 memory = []
-pcie-devices = ["resource-status"]
+pcie-devices = ["resource-status", "impl-nv-bmc-expand"]
 power = [] # Support of legacy PowerSubsystem
 power-supplies = []
 processors = []
@@ -79,6 +80,7 @@ secure-boot = []
 sensors = ["impl-entity-link"]
 session-service = ["impl-nv-bmc-expand"]
 storages = []
+task-service = []
 thermal = []  # Support of legacy ThermalSubsystem
 update-service = ["patch-payload-get", "patch-collection"]
 

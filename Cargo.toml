@@ -59,6 +59,7 @@ toml = { version = "0.9", default-features = false }
 
 # Dev
 tokio = "1"
+tokio-util = { version = "0.7" }
 tokio-test = "0.4"
 # had to use 0.6.4 since it works with 2018 edition (2024 needs extra work) 
 wiremock = "0.6.4"
